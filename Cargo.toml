@@ -1,0 +1,8 @@
+[package]
+name = "dlt-viewer-term"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dlt-core = "0.20.1"
+ratatui = "0.29.0"
