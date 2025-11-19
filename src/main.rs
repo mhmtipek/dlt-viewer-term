@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fs::{self, File},
     io,
-    thread::{self, current},
+    thread::{self},
     time::Duration,
 };
 
@@ -12,11 +12,13 @@ use ratatui::{
     DefaultTerminal,
     crossterm::event::{self, KeyCode, KeyEventKind, KeyModifiers},
     layout::Rect,
+    style::{Color, Stylize},
     text::Text,
+    widgets::{Block, Borders},
 };
 
 use dlt_core::{
-    dlt::{self, ExtendedHeader, PayloadContent},
+    dlt::{self, PayloadContent},
     parse::{DltParseError, ParsedMessage},
     read::{DltMessageReader, read_message},
 };
@@ -33,7 +35,7 @@ struct Args {
     file: String,
 }
 
-// Load file into the data structure of messages
+// Load file into the hashmap of messages. key is timestamp
 fn load_file(file_name: &String) -> HashMap<u64, dlt_core::dlt::Message> {
     let file = File::open(&file_name).unwrap();
     let mut dlt_reader = DltMessageReader::new(file, true);
@@ -90,6 +92,76 @@ fn size_to_text(size: u64) -> String {
     format!("{:.2} GB", size as f32 / (1024.0 * 1024.0 * 1024.0))
 }
 
+// Convert message to a row on the log table
+fn message_to_text(message: dlt_core::dlt::Message) -> Option<String> {
+    let ecu_id = message.header.ecu_id.unwrap_or(String::from("????"));
+    if message.extended_header.is_none() {
+        ()
+    }
+    let extended_header = message.extended_header.unwrap();
+    let app_id = extended_header.application_id;
+    let context_id = extended_header.context_id;
+    if message.storage_header.is_none() {
+        ()
+    }
+    let storage_header = message.storage_header.unwrap();
+
+    let payload_text = match message.payload {
+        PayloadContent::Verbose(args) => {
+            let mut message_text: String = String::from("");
+            for arg in args {
+                match arg.value {
+                    dlt::Value::StringVal(text) => {
+                        message_text = text;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            message_text
+        }
+        PayloadContent::ControlMsg(control_type, data) => {
+            format!(
+                "{:?} {:#X} {:#X} {:#X} {:#X} {:#X} {:#X} {:#X} {:#X}",
+                control_type,
+                data[0],
+                data[1],
+                data[2],
+                data[3],
+                data[4],
+                data[5],
+                data[6],
+                data[7]
+            )
+        }
+        _ => "".to_string(),
+    };
+
+    let message_type = match extended_header.message_type {
+        dlt::MessageType::Log(level) => format!("log {:?}", level),
+        dlt::MessageType::ApplicationTrace(_) => "app_trace".to_string(),
+        dlt::MessageType::NetworkTrace(_) => "net_trace".to_string(),
+        dlt::MessageType::Control(_) => "control".to_string(),
+        dlt::MessageType::Unknown(_) => "unknown".to_string(),
+    };
+
+    Some(format!(
+        "{}.{:<6} {:4} {:4} {:4} {:03} {:7} {} {}",
+        DateTime::<Utc>::from(
+            UNIX_EPOCH + Duration::from_secs(storage_header.timestamp.seconds as u64)
+        )
+        .format("%Y/%m/%d %H:%M:%S"),
+        storage_header.timestamp.microseconds,
+        ecu_id,
+        app_id,
+        context_id,
+        message.header.message_counter,
+        message.header.session_id.unwrap_or(0),
+        message_type,
+        payload_text
+    ))
+}
+
 fn run(mut terminal: DefaultTerminal, file: &String) -> io::Result<()> {
     let file_meta_data = fs::metadata(file)?;
 
@@ -136,7 +208,8 @@ fn run(mut terminal: DefaultTerminal, file: &String) -> io::Result<()> {
     }
 
     let messages = load_file_thread_handle.join().unwrap();
-    let mut current_index = 0;
+    let mut current_view_index = 0; // Index in messages which will be displayed in first row on screen
+    let mut current_index = 0; // Currently selected index
 
     let keys_sorted_by_timestamp = sorted(messages.keys()).collect::<Vec<_>>();
 
@@ -144,89 +217,43 @@ fn run(mut terminal: DefaultTerminal, file: &String) -> io::Result<()> {
         let mut window_height = 0;
         terminal.draw(|frame| {
             window_height = frame.area().height;
+
+            // Draw background
+            frame.render_widget(
+                Block::new().borders(Borders::NONE).bg(Color::Black),
+                frame.area(),
+            );
+
             let mut line = 0;
-            for i in current_index..keys_sorted_by_timestamp.len() {
+            for i in current_view_index..keys_sorted_by_timestamp.len() {
                 let key = keys_sorted_by_timestamp[i];
-                let message = messages[key].clone();
-                let ecu_id = message.header.ecu_id.unwrap_or(String::from("????"));
-                let extended_header;
-                if message.extended_header.is_none() {
+                let line_text = message_to_text(messages[key].clone());
+                if line_text.is_none() {
                     continue;
-                } else {
-                    extended_header = message.extended_header.unwrap();
                 }
-                let app_id = extended_header.application_id;
-                let context_id = extended_header.context_id;
-                let storage_header;
-                if message.storage_header.is_none() {
-                    continue;
-                } else {
-                    storage_header = message.storage_header.unwrap();
-                }
-
-                let line_text = format!(
-                    "{}.{:<6} {:4} {:4} {:4} {:03} {:<7} {}",
-                    DateTime::<Utc>::from(
-                        UNIX_EPOCH + Duration::from_secs(storage_header.timestamp.seconds as u64)
-                    )
-                    .format("%Y/%m/%d %H:%M:%S"),
-                    storage_header.timestamp.microseconds,
-                    ecu_id,
-                    app_id,
-                    context_id,
-                    message.header.message_counter,
-                    message.header.session_id.unwrap_or(0),
-                    match message.payload {
-                        PayloadContent::Verbose(args) => {
-                            let mut message_text: String = String::from("");
-                            for arg in args {
-                                match arg.value {
-                                    dlt::Value::StringVal(text) => {
-                                        message_text = text;
-                                        break;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            message_text
-                        }
-                        PayloadContent::ControlMsg(control_type, data) => {
-                            format!(
-                                "{:?} {:#X} {:#X} {:#X} {:#X} {:#X} {:#X} {:#X} {:#X}",
-                                control_type,
-                                data[0],
-                                data[1],
-                                data[2],
-                                data[3],
-                                data[4],
-                                data[5],
-                                data[6],
-                                data[7]
-                            )
-                        }
-                        _ => {
-                            "".to_string()
-                        }
-                    }
-                );
 
                 frame.render_widget(
-                    Text::from(line_text).left_aligned(),
+                    Text::from(line_text.unwrap()).left_aligned().bg({
+                        if current_index == i {
+                            Color::DarkGray
+                        } else {
+                            Color::Black
+                        }
+                    }),
                     Rect::new(0, line, frame.area().width, 1),
-                );
-
-                frame.render_widget(
-                    Text::from(format!("{printable_file_size} {printable_file_name}"))
-                        .right_aligned(),
-                    Rect::new(0, frame.area().height - 1, frame.area().width, 1),
                 );
 
                 line = line + 1;
 
-                if i >= current_index + frame.area().height as usize - 2 {
+                if i >= current_view_index + frame.area().height as usize - 2 {
                     break;
                 }
             }
+
+            frame.render_widget(
+                Text::from(format!("{printable_file_size} {printable_file_name}")).right_aligned(),
+                Rect::new(0, frame.area().height - 1, frame.area().width, 1),
+            );
         })?;
 
         match event::poll(Duration::from_millis(200)) {
@@ -236,37 +263,36 @@ fn run(mut terminal: DefaultTerminal, file: &String) -> io::Result<()> {
                     match key.kind {
                         KeyEventKind::Press => match key.code {
                             KeyCode::Char('q') => break,
-                            KeyCode::Down => {
-                                if current_index
-                                    <= keys_sorted_by_timestamp.len() - window_height as usize
-                                {
-                                    current_index = current_index + 1
-                                }
-                            }
-                            KeyCode::Up => {
-                                if current_index > 0 {
-                                    current_index = current_index - 1
-                                }
-                            }
                             KeyCode::Char('u') => {
                                 if is_ctrl_pressed {
-                                    if current_index > window_height as usize - 1 {
-                                        current_index = current_index - window_height as usize + 1;
-                                    } else {
+                                    if current_index < (window_height as usize - 1) / 2 {
                                         current_index = 0;
+                                    } else {
+                                        current_index =
+                                            current_index - (window_height as usize - 1) / 2;
                                     }
                                 }
                             }
                             KeyCode::Char('d') => {
                                 if is_ctrl_pressed {
-                                    if (current_index + window_height as usize - 1)
-                                        < (keys_sorted_by_timestamp.len() - window_height as usize)
+                                    if current_index + (window_height as usize - 1) / 2
+                                        > keys_sorted_by_timestamp.len()
                                     {
-                                        current_index = current_index + window_height as usize - 1;
+                                        current_index = keys_sorted_by_timestamp.len() - 1;
                                     } else {
                                         current_index =
-                                            keys_sorted_by_timestamp.len() - window_height as usize;
+                                            current_index + (window_height as usize - 1) / 2;
                                     }
+                                }
+                            }
+                            KeyCode::Up => {
+                                if current_index != 0 {
+                                    current_index = current_index - 1;
+                                }
+                            }
+                            KeyCode::Down => {
+                                if current_index != keys_sorted_by_timestamp.len() - 1 {
+                                    current_index = current_index + 1;
                                 }
                             }
                             _ => {}
@@ -276,6 +302,13 @@ fn run(mut terminal: DefaultTerminal, file: &String) -> io::Result<()> {
                 }
             }
             _ => {}
+        }
+
+        if current_view_index > current_index {
+            current_view_index = current_index;
+        }
+        if current_view_index + (window_height as usize - 2) < current_index {
+            current_view_index = current_index - (window_height as usize - 2);
         }
     }
 
